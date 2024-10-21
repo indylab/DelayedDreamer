@@ -1,6 +1,6 @@
 import functools
 import time
-from collections import deque
+from collections import deque, defaultdict
 
 import numpy as np
 
@@ -555,3 +555,33 @@ class RestartOnException(base.Wrapper):
       self.env = self._ctor()
       action['reset'] = np.ones_like(action['reset'])
       return self.env.step(action)
+
+
+class FrameStackImage(base.Wrapper):
+
+  def __init__(self, env, stack_size=2):
+    super().__init__(env)
+    self._stack_size = int(stack_size)
+    self._stacks = defaultdict(lambda: deque(maxlen=self._stack_size))
+    self._keys = [k for k, v in env.obs_space.items() if len(v.shape) > 1]
+
+  @functools.cached_property
+  def obs_space(self):
+    spaces = self.env.obs_space
+    for key in self._keys:
+      num_channels = spaces[key].shape[2] * self._stack_size
+      shape = spaces[key].shape[:2] + (num_channels,)
+      spaces[key] = spacelib.Space(np.uint8, shape)
+    return spaces
+
+  def step(self, action):
+    obs = self.env.step(action)
+    for key in self._keys:
+      if obs['is_first']:
+        self._stacks[key].append(obs[key])
+      obs[key] = self._stack_image(obs[key], key)
+    return obs
+
+  def _stack_image(self, image, key):
+    self._stacks[key].append(image)
+    return np.concatenate(self._stacks[key], axis=2)

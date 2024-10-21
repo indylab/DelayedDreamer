@@ -259,11 +259,16 @@ class WorldModel(nj.Module):
     shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
     shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
     self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
-    self.rssm = nets.RSSM(**config.rssm, name='rssm')
+
+    if config.mdp_deterministic_model:
+      self.rssm = nets.LatentStateSpaceMDP(**config.rssm, name='rssm')
+    else:
+      self.rssm = nets.RSSM(**config.rssm, name='rssm')
+
     self.heads = {
-        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
-        'reward': nets.MLP((), **config.reward_head, name='rew'),
-        'cont': nets.MLP((), **config.cont_head, name='cont')}
+        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec', dims='deter'),
+        'reward': nets.MLP((), **config.reward_head, name='rew', dims='deter'),
+        'cont': nets.MLP((), **config.cont_head, name='cont',  dims='deter')}
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
     scales = self.config.loss_scales.copy()
     image, vector = scales.pop('image'), scales.pop('vector')
@@ -283,7 +288,88 @@ class WorldModel(nj.Module):
     metrics.update(mets)
     return state, outs, metrics
 
+  def mdp_deter_loss(self, data, state):
+    embed = self.encoder(data)
+
+    prev_latent, prev_action = state
+    prev_actions = jnp.concatenate([
+      prev_action[:, None], data['action'][:, :-1]], 1)
+
+    data["t"] = jnp.repeat(jnp.arange(start=0, stop=self.config.batch_length)[jnp.newaxis, :],
+                           repeats=self.config.batch_size, axis=0)
+
+    rssm: nets.LatentStateSpaceMDP = self.rssm
+
+    head_input_states, dynamics_preds, dynamics_targets, obs_encoder_predictions = rssm.observe_td(
+      embed, prev_actions, data['is_first'], prev_latent)
+
+    dists = {}
+    feats = {**head_input_states, 'embed': embed}
+    heads = {**self.heads}
+
+    for name, head in heads.items():
+      out = head(feats if name in self.config.grad_heads else sg(feats))
+      out = out if isinstance(out, dict) else {name: out}
+      dists.update(out)
+
+    losses = {}
+
+    if self.config.mdp_use_dyn_consistency_loss:
+      consistency_loss = self.rssm.dyn_loss(post=dynamics_targets, prior=dynamics_preds, is_first=data['is_first'],
+                                            **self.config.dyn_loss)
+    else:
+      state_pred_distance = (dynamics_preds['stoch_params'] - sg(dynamics_targets['stoch_params'])) ** 2  # MSE loss
+      state_pred_distance = jnp.where(state_pred_distance < 1e-8, 0, state_pred_distance)
+      consistency_loss = state_pred_distance.sum(axis=(-2, -1))
+
+    assert consistency_loss.shape[0] == embed.shape[0], (consistency_loss.shape, embed.shape[:2])
+    assert consistency_loss.shape[1] == (embed.shape[1] - 1), (consistency_loss.shape, embed.shape[:2])
+    assert len(consistency_loss.shape) == 2, consistency_loss.shape
+    consistency_loss *= (self.config.mdp_loss_rho ** data["t"][:, :-1])
+    losses['consistency'] = consistency_loss
+
+    if self.config.use_rep_loss_with_mdp:
+      rep_loss = self.rssm.rep_loss(post=dynamics_targets, prior=dynamics_preds, is_first=data['is_first'],
+                                    **self.config.dyn_loss)
+      assert rep_loss.shape[0] == embed.shape[0], (rep_loss.shape, embed.shape[:2])
+      assert rep_loss.shape[1] == (embed.shape[1] - 1), (rep_loss.shape, embed.shape[:2])
+      assert len(rep_loss.shape) == 2, rep_loss.shape
+      rep_loss *= (self.config.mdp_loss_rho ** data["t"][:, :-1])
+      losses['rep'] = rep_loss
+
+    for key, dist in dists.items():
+      data_key = key.removeprefix("prior_")
+      print(f"key: {key}, dist: {dist.mean().shape}, data: {data[data_key].shape}")
+      loss = -dist.log_prob(data[data_key].astype(jnp.float32))
+      assert loss.shape == embed.shape[:2], (key, loss.shape)
+      loss *= (self.config.mdp_loss_rho ** data["t"])
+      losses[key] = loss
+
+    scaled = {k: v * self.scales[k.removeprefix("prior_")] for k, v in losses.items()}
+    scaled = {k: v.sum(axis=(0, 1)) for k, v in scaled.items()}
+    model_loss = sum(scaled.values())
+
+    if self.config.mdp_context_is_head_inputs:
+      out = {'embed': embed, 'post': head_input_states, 'prior': head_input_states}
+    else:
+      # default
+      out = {'embed': embed, 'post': obs_encoder_predictions, 'prior': head_input_states}
+
+    out.update({f'{k}_loss': v for k, v in losses.items()})
+    last_latent = {k: v[:, -1] for k, v in head_input_states.items()}
+    last_action = data['action'][:, -1]
+    state = last_latent, last_action
+    metrics = self._metrics(data=data, dists=dists, post=head_input_states, prior=head_input_states,
+                            losses=losses, model_loss=model_loss)
+
+    loss_out = model_loss.mean()
+
+    return loss_out, (state, out, metrics)
+
   def loss(self, data, state):
+    if isinstance(self.rssm, nets.LatentStateSpaceMDP):
+      return self.mdp_deter_loss(data, state)
+
     embed = self.encoder(data)
     prev_latent, prev_action = state
     prev_actions = jnp.concatenate([
@@ -500,19 +586,23 @@ class WorldModel(nj.Module):
     state = self.initial(len(data['is_first']))
     report = {}
     report.update(self.loss(data, state)[-1][-1])
-    context, _ = self.rssm.observe(
-        self.encoder(data)[:6, :5], data['action'][:6, :5],
-        data['is_first'][:6, :5])
-    start = {k: v[:, -1] for k, v in context.items()}
-    recon = self.heads['decoder'](context)
-    openl = self.heads['decoder'](
-        self.rssm.imagine(data['action'][:6, 5:], start))
-    for key in self.heads['decoder'].cnn_shapes.keys():
-      truth = data[key][:6].astype(jnp.float32)
-      model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
-      error = (model - truth + 1) / 2
-      video = jnp.concatenate([truth, model, error], 2)
-      report[f'openl_{key}'] = jaxutils.video_grid(video)
+
+    embed = self.encoder(data)
+    if embed.shape[1] >= 6:
+      # Log videos for world model decoder
+      context, _ = self.rssm.observe(
+          embed[:6, :5], data['action'][:6, :5],
+          data['is_first'][:6, :5])
+      start = {k: v[:, -1] for k, v in context.items()}
+      recon = self.heads['decoder'](context)
+      openl = self.heads['decoder'](
+          self.rssm.imagine(data['action'][:6, 5:], start))
+      for key in self.heads['decoder'].cnn_shapes.keys():
+        truth = data[key][:6].astype(jnp.float32)
+        model = jnp.concatenate([recon[key].mode()[:, :5], openl[key].mode()], 1)
+        error = (model - truth + 1) / 2
+        video = jnp.concatenate([truth, model, error], 2)
+        report[f'openl_{key}'] = jaxutils.video_grid(video)
     return report
 
   def _metrics(self, data, dists, post, prior, losses, model_loss):

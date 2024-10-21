@@ -1,4 +1,5 @@
 import re
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -261,6 +262,195 @@ class RSSM(nj.Module):
     return loss
 
 
+class LatentStateSpaceMDP(RSSM):
+
+  def __init__(
+      self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',
+      unimix=0.01, action_clip=1.0, img_hidden_layers=2, **kw):
+    self._deter = deter
+    self._stoch = stoch
+    self._classes = classes
+    self._unroll = unroll
+    self._initial = initial
+    self._unimix = unimix
+    self._action_clip = action_clip
+    self._img_hidden_layers = img_hidden_layers
+    self._kw = kw
+
+  def initial(self, bs):
+    if self._classes:
+      state = dict(
+        deter=jnp.zeros([bs, self._deter], f32),
+        logit=jnp.zeros([bs, self._stoch, self._classes], f32),
+        stoch_params=jnp.zeros([bs, self._stoch, self._classes], f32),
+        stoch_raw_logits=jnp.zeros([bs, self._stoch * self._classes], f32),
+      )
+    else:
+      raise NotImplementedError
+
+    if self._initial == 'zeros':
+      return cast(state)
+    elif self._initial == 'learned':
+      print(f"Using all zeroes for initial state even though 'learned' is specified for this.")
+      return cast(state)
+    else:
+      raise NotImplementedError(self._initial)
+
+  def get_dist(self, state, argmax=False, use_all_variables=False):
+    if self._classes:
+      logit = state['logit'].astype(f32)
+      return tfd.Independent(jaxutils.OneHotDist(logit), 1)
+    else:
+      raise NotImplementedError
+
+  def _stats(self, name, x):
+    if self._classes:
+      x = self.get(name, Linear, self._stoch * self._classes)(x)
+      orig_logit = x
+      logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
+      probs = jax.nn.softmax(logit, -1)
+      stats = {'logit': logit,
+               'stoch_raw_logits': orig_logit,  # in case we ever add unimix, etc
+               'stoch_params': probs,
+
+               }
+      return stats
+    else:
+      raise NotImplementedError
+
+  def imagine(self, action, state=None):
+    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    state = self.initial(action.shape[0]) if state is None else state
+    assert isinstance(state, dict), state
+    action = swap(action)
+    step = partial(self.img_step)
+    prior = jaxutils.scan(step, action, state, self._unroll)
+    prior = {k: swap(v) for k, v in prior.items()}
+    return prior
+
+  def img_step(self, prev_state, prev_action):
+    prev_stoch_params = prev_state['stoch_params']
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+        self._action_clip, jnp.abs(prev_action)))
+
+    if self._classes:
+      shape = prev_stoch_params.shape[:-2] + (self._stoch * self._classes,)
+      prev_stoch_params = prev_stoch_params.reshape(shape)
+    if len(prev_action.shape) > len(prev_stoch_params.shape):  # 2D actions.
+      shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
+      prev_action = prev_action.reshape(shape)
+
+    x = jnp.concatenate([prev_stoch_params, prev_action], -1)
+
+    x = self.get('img_in', Linear, **self._kw)(x)
+    for i in range(self._img_hidden_layers):
+      x = self.get(f'img_hidden{i + 1}', Linear, **self._kw)(x)
+    x = self.get('img_out', Linear, **self._kw)(x)
+    stats = self._stats('img_stats', x)
+
+    prior = {
+      'deter': prev_state['deter'],
+      **stats}
+
+    return cast(prior)
+
+  def _gru(self, x, deter):
+    raise NotImplementedError
+
+  def observe_td(self, embed, action, is_first, state=None):
+    swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
+    if state is None:
+      state = self.initial(action.shape[0])
+
+    obs_step = lambda prev, inputs: self.obs_step(prev[0], *inputs, calculate_prior=False)
+    inputs = swap(action), swap(embed), swap(is_first)
+    start = state, None
+    post, _ = jaxutils.scan(obs_step, inputs, start, self._unroll)
+    encoder_predictions = {k: swap(v) for k, v in post.items()}
+
+    first_encoder_state = {k: v[:, 0] for k, v in encoder_predictions.items()}
+    dynamics_targets = {k: v[:, 1:] for k, v in encoder_predictions.items()}
+
+    img_step = lambda prev, inputs: self.img_step(prev, *inputs)
+    inputs = (swap(action[:, 1:]),)
+    start = first_encoder_state
+    dynamics_preds = jaxutils.scan(img_step, inputs, start, self._unroll)
+    dynamics_preds = {k: swap(v) for k, v in dynamics_preds.items()}
+
+    head_input_states = {k: jnp.concatenate((encoder_predictions[k][:, 0:1], dynamics_preds[k]), axis=1) for k in
+                         dynamics_preds.keys()}
+
+    return head_input_states, dynamics_preds, dynamics_targets, encoder_predictions
+
+  def obs_step(self, prev_state, prev_action, embed, is_first, calculate_prior=True):
+    is_first = cast(is_first)
+    prev_action = cast(prev_action)
+    if self._action_clip > 0.0:
+      prev_action *= sg(self._action_clip / jnp.maximum(
+        self._action_clip, jnp.abs(prev_action)))
+
+    prev_state, prev_action = jax.tree_util.tree_map(
+      lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
+    prev_state = jax.tree_util.tree_map(
+      lambda x, y: x + self._mask(y, is_first),
+      prev_state, self.initial(len(is_first)))
+
+    if calculate_prior:
+      prior = self.img_step(prev_state, prev_action)
+    else:
+      prior = None
+
+    x = embed
+    x = self.get('obs_out', Linear, **self._kw)(x)
+    stats = self._stats('obs_stats', x)
+
+    post = {
+      'deter': prev_state['deter'],
+      **stats}
+
+    return cast(post), cast(prior)
+
+  def dyn_loss(self, post, prior, is_first, impl='kl', free=1.0):
+    if impl == 'kl':
+      loss = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+    elif impl == 'kl_masked':
+      is_first = cast(is_first)
+      # if this is the first timestep then loss should be 0
+      loss = self.get_dist(sg(post)).kl_divergence(self.get_dist(prior))
+      loss = jnp.where(is_first, 0, loss)
+    elif impl == 'logprob':
+      loss = -self.get_dist(prior).log_prob(sg(post['stoch']))
+    else:
+      raise NotImplementedError(impl)
+    if free:
+      loss = jnp.maximum(loss, free)
+    return loss
+
+  def rep_loss(self, post, prior, is_first, impl='kl', free=1.0):
+    if impl == 'kl':
+      loss = self.get_dist(post, use_all_variables=True).kl_divergence(
+        self.get_dist(sg(prior), use_all_variables=True))
+    elif impl == 'kl_masked':
+      is_first = cast(is_first)
+      # if this is the first timestep then loss should be 0
+      loss = self.get_dist(post, use_all_variables=True).kl_divergence(
+        self.get_dist(sg(prior), use_all_variables=True))
+      loss = jnp.where(is_first, 0, loss)
+    elif impl == 'uniform':
+      uniform = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), prior)
+      loss = self.get_dist(post, use_all_variables=True).kl_divergence(self.get_dist(uniform, use_all_variables=True))
+    elif impl == 'entropy':
+      loss = -self.get_dist(post, use_all_variables=True).entropy()
+    elif impl == 'none':
+      loss = jnp.zeros(post['deter'].shape[:-1])
+    else:
+      raise NotImplementedError(impl)
+    if free:
+      loss = jnp.maximum(loss, free)
+    return loss
+
 class MultiEncoder(nj.Module):
 
   def __init__(
@@ -317,7 +507,7 @@ class MultiDecoder(nj.Module):
       self, shapes, inputs=['tensor'], cnn_keys=r'.*', mlp_keys=r'.*',
       mlp_layers=4, mlp_units=512, cnn='resize', cnn_depth=48, cnn_blocks=2,
       image_dist='mse', vector_dist='mse', resize='stride', bins=255,
-      outscale=1.0, minres=4, cnn_sigmoid=False, **kw):
+      outscale=1.0, minres=4, cnn_sigmoid=False, dims='deter', **kw):
     excluded = ('is_first', 'is_last', 'is_terminal', 'reward')
     shapes = {k: v for k, v in shapes.items() if k not in excluded}
     self.cnn_shapes = {
@@ -342,8 +532,8 @@ class MultiDecoder(nj.Module):
         raise NotImplementedError(cnn)
     if self.mlp_shapes:
       self._mlp = MLP(
-          self.mlp_shapes, mlp_layers, mlp_units, **mlp_kw, name='mlp')
-    self._inputs = Input(inputs, dims='deter')
+        self.mlp_shapes, mlp_layers, mlp_units, **mlp_kw, name='mlp')
+    self._inputs = Input(inputs, dims=dims)
     self._image_dist = image_dist
 
   def __call__(self, inputs, drop_loss_indices=None):

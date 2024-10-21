@@ -29,6 +29,8 @@ class JAXAgent(embodied.Agent):
     self.batch_size = config.batch_size
     self.batch_length = config.batch_length
     self.data_loaders = config.data_loaders
+    self.data_load_prefetch_source = config.data_load_prefetch_source
+    self.data_load_prefetch_batch = config.data_load_prefetch_batch
     self.delay_config = config.delay
     self._setup()
     self.agent = agent_cls(obs_space, act_space, step, config, name='agent')
@@ -125,10 +127,10 @@ class JAXAgent(embodied.Agent):
 
   def dataset(self, generator):
     batcher = embodied.Batcher(
-        sources=[generator] * self.batch_size,
-        workers=self.data_loaders,
-        postprocess=lambda x: self._convert_inps(x, self.train_devices),
-        prefetch_source=4, prefetch_batch=1)
+      sources=[generator] * self.batch_size,
+      workers=self.data_loaders,
+      postprocess=lambda x: self._convert_inps(x, self.train_devices),
+      prefetch_source=self.data_load_prefetch_source, prefetch_batch=self.data_load_prefetch_batch)
     return batcher()
 
   def save(self):

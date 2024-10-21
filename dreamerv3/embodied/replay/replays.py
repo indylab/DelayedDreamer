@@ -7,7 +7,7 @@ class Uniform(generic.Generic):
 
   def __init__(
       self, length, capacity=None, directory=None, online=False, chunks=1024,
-      min_size=1, samples_per_insert=None, tolerance=1e4, seed=0):
+      min_size=1, samples_per_insert=None, tolerance=1e4, seed=0, can_save=True):
     if samples_per_insert:
       limiter = limiters.SamplesPerInsert(
           samples_per_insert, tolerance, min_size)
@@ -23,4 +23,5 @@ class Uniform(generic.Generic):
         directory=directory,
         online=online,
         chunks=chunks,
+        can_save=can_save,
     )

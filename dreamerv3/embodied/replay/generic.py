@@ -12,7 +12,7 @@ class Generic:
 
   def __init__(
       self, length, capacity, remover, sampler, limiter, directory,
-      overlap=None, online=False, chunks=1024):
+      overlap=None, online=False, chunks=1024, can_save=True):
     assert capacity is None or 1 <= capacity
     self.length = length
     self.capacity = capacity
@@ -28,6 +28,7 @@ class Generic:
       self.online_queue = deque()
       self.online_stride = length
       self.online_counters = defaultdict(int)
+    self.can_save = can_save
     self.saver = directory and saver.Saver(directory, chunks)
     self.metrics = {
         'samples': 0,
@@ -64,7 +65,8 @@ class Generic:
     step['id'] = np.asarray(embodied.uuid(step.get('id')))
     stream = self.streams[worker]
     stream.append(step)
-    self.saver and self.saver.add(step, worker)
+    if self.saver and self.can_save:
+      self.saver.add(step, worker)
     self.counters[worker] += 1
     if self.online:
       self.online_counters[worker] += 1
@@ -123,7 +125,7 @@ class Generic:
       self.sampler.prioritize(ids, prios)
 
   def save(self, wait=False):
-    if not self.saver:
+    if not self.saver or not self.can_save:
       return
     self.saver.save(wait)
     # return {

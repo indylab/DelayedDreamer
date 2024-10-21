@@ -1,0 +1,22 @@
+rsync -vr \
+--exclude rllib/data \
+--exclude exp \
+--exclude exp_plot \
+--exclude dbc/.git \
+--exclude event_files \
+--exclude .idea \
+--exclude .vscode \
+--exclude .ipynb_checkpoints \
+--exclude __pycache__ \
+--exclude lightning_logs \
+--exclude gpu.lock \
+--exclude '*.cache' \
+--exclude simdreamer/scores \
+--exclude simdreamer/logs \
+--exclude logs \
+--exclude log \
+--exclude logdir \
+--exclude logsdl \
+--exclude archive \
+--exclude *.json.gz \
+~/git/DelayedDreamer arcus-19:~/git/

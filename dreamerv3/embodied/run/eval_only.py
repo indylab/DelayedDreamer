@@ -33,7 +33,12 @@ def eval_only(agent, env, logger, args):
     stats = {}
     for key in args.log_keys_video:
       if key in ep:
-        stats[f'policy_{key}'] = ep[key]
+        print(f"video stat: {key} shape: {ep[key].shape}")
+        if ep[key].shape[3] > 3:
+          # more channels than just RGB, maybe frame stacking
+          stats[f'policy_{key}'] = ep[key][:, :, :, :3]
+        else:
+          stats[f'policy_{key}'] = ep[key]
     for key, value in ep.items():
       if not args.log_zeros and key not in nonzeros and (value == 0).all():
         continue

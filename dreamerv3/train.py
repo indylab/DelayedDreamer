@@ -160,7 +160,7 @@ def make_replay(
   length = config.batch_length
   size = config.replay_size // 10 if is_eval else config.replay_size
   if config.replay == 'uniform' or is_eval:
-    kw = {'online': config.replay_online}
+    kw = {'online': config.replay_online, 'can_save': config.save_replay}
     if rate_limit and config.run.train_ratio > 0:
       kw['samples_per_insert'] = config.run.train_ratio / config.batch_length
       kw['tolerance'] = 10 * config.batch_size
@@ -235,6 +235,8 @@ def wrap_env(env, config):
   for name, space in env.act_space.items():
     if not space.discrete:
       env = wrappers.ClipAction(env, name)
+  if args.framestack_image > 1:
+    env = wrappers.FrameStackImage(env, stack_size=args.framestack_image)
   if config.delay.delayed:
     assert config.delay.delay_length >= 0, \
       "Something wrong. config.delay.delay_length must be greater than or equal to 0. " + \

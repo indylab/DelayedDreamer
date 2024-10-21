@@ -5,7 +5,8 @@ import time
 import traceback
 
 import numpy as np
-
+import itertools
+import collections
 
 class Batcher:
 
@@ -38,7 +39,38 @@ class Batcher:
       self._threads.append(batcher)
     else:
       self._iterators = [source() for source in sources]
+      self._prefetch_amt = prefetch_batch
+      self._batch_iterator = self._get_local_worker_batch_iter()
+      self._batch_prefetch_iterator = self._get_local_worker_prefetch_batch_iter()
+      self._batch_prefetch_queue = collections.deque()
+
     self._once = False
+
+  def _get_local_worker_batch_iter(self):
+    while True:
+      elems = [next(x) for x in self._iterators]
+      batch = {k: np.stack([x[k] for x in elems], 0) for k in elems[0]}
+      if self._postprocess:
+        batch = self._postprocess(batch)
+      if isinstance(batch, Exception):
+        raise batch
+      yield batch
+
+  def _local_worker_fetch_batch(self, n_batch):
+    for batch in itertools.islice(self._batch_iterator, n_batch):
+      self._batch_prefetch_queue.append(batch)
+
+  def _get_local_worker_prefetch_batch_iter(self):
+    while True:
+      if self._batch_prefetch_queue:
+        yield self._batch_prefetch_queue.popleft()
+        self.fetch_batch()
+      else:
+        self.fetch_batch()
+
+  def fetch_batch(self):
+    if not self._workers and len(self._batch_prefetch_queue) < self._prefetch_amt:
+      self._local_worker_fetch_batch(1)
 
   def close(self):
     if self._workers:
@@ -60,11 +92,10 @@ class Batcher:
   def __next__(self):
     if self._workers:
       batch = self._batches.get()
+      if isinstance(batch, Exception):
+        raise batch
     else:
-      elems = [next(x) for x in self._iterators]
-      batch = {k: np.stack([x[k] for x in elems], 0) for k in elems[0]}
-    if isinstance(batch, Exception):
-      raise batch
+      batch = next(self._batch_prefetch_iterator)
     return batch
 
   def _creator(self, sources, outputs):
